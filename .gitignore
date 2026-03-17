@@ -143,3 +143,20 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+# big files
+**/*.pt
+**/checkpoints
+**/checkpoints-merged
+**/wget-log
+**/_build/
+**/*.ckpt
+**/*.whl
+**/outputs
+**/*.tar.gz
+**/playground
+**/wandb
+**/swanlab
+**/dapo
+**/checkpoint*
+**/*.jsonl

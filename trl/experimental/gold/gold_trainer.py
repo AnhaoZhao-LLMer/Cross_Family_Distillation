@@ -801,6 +801,7 @@ class GOLDTrainer(SFTTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: Optional["PeftConfig"] = None,
     ):
+        
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         if isinstance(model, str) and self.model_revision is not None:
@@ -996,7 +997,7 @@ class GOLDTrainer(SFTTrainer):
 
                 vllm_quantization = None
                 if is_bitsandbytes_available():
-                    for _, module in model.named_modules():
+                    for _, module in self.model.named_modules():
                         if isinstance(module, bnb.nn.Linear4bit):
                             vllm_quantization = "bitsandbytes"
                             break
@@ -1009,7 +1010,7 @@ class GOLDTrainer(SFTTrainer):
                     tensor_parallel_size=self.vllm_tensor_parallel_size,
                     gpu_memory_utilization=self.vllm_gpu_memory_utilization,
                     max_num_seqs=self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps,
-                    max_model_len=args.max_length,
+                    # max_model_len=args.max_length,
                     distributed_executor_backend="external_launcher",
                     # Feed identical seed for tp groups to ensure sampling results are the same across workers
                     seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
@@ -1066,7 +1067,7 @@ class GOLDTrainer(SFTTrainer):
         # Check if dataset is already processed
         column_names = list(next(iter(dataset)).keys())
         is_processed = "input_ids" in column_names
-
+        
         # Use our enhanced dataset preparation for:
         # 1. ULD loss with cross-tokenizer (need original text preservation)
         # 2. Any unprocessed dataset (need attention_mask for DataCollatorForChatML)
@@ -1144,7 +1145,7 @@ class GOLDTrainer(SFTTrainer):
             def tokenize_with_original_text(example, processing_class, dataset_text_field, assistant_only_loss):
                 """Modified tokenization function that preserves original text."""
                 result = {}
-
+                
                 if "prompt" in example:  # prompt-completion case
                     # Store original text
                     result["original_prompt_text"] = example["prompt"]
@@ -1277,7 +1278,7 @@ class GOLDTrainer(SFTTrainer):
                 },
                 **map_kwargs,
             )
-
+            
             # Pack or truncate
             if packing:
                 if args.max_length is None:
@@ -1391,6 +1392,7 @@ class GOLDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
                 prompt_texts = inputs["original_prompt_text"]
@@ -1589,6 +1591,7 @@ class GOLDTrainer(SFTTrainer):
         return (loss, outputs_student) if return_outputs else loss
 
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
+        
         # Generate output with respect to the prompt only
         if self.use_transformers_paged:
             previous_attn = self.model.config._attn_implementation
@@ -1644,10 +1647,14 @@ class GOLDTrainer(SFTTrainer):
         if pad_token_id is not None:
             new_attention_mask[new_input_ids == pad_token_id] = 0
 
+        # new_labels = torch.full_like(new_input_ids, -100)
+        # for idx in range(batch_size):
+        #     length = int(prompt_lengths[idx].item())
+        #     new_labels[idx, length:] = new_input_ids[idx, length:]
+        length = int(prompt_lengths.max().item())
         new_labels = torch.full_like(new_input_ids, -100)
-        for idx in range(batch_size):
-            length = int(prompt_lengths[idx].item())
-            new_labels[idx, length:] = new_input_ids[idx, length:]
+        new_labels[:, length:] = new_input_ids[:, length:]
+
 
         if pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
@@ -1655,7 +1662,7 @@ class GOLDTrainer(SFTTrainer):
         prompt_texts = []
         completion_texts = []
         for idx in range(batch_size):
-            length = int(prompt_lengths[idx].item())
+            # length = int(prompt_lengths[idx].item())
             prompt_tokens = inputs["prompts"][idx]
             if prompt_mask is not None:
                 prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
@@ -1682,11 +1689,11 @@ class GOLDTrainer(SFTTrainer):
     @profiling_decorator
     def _generate_on_policy_outputs_vllm(self, inputs, generation_config, pad_token_id=None):
         device = self.accelerator.device
-
+        
         # Decode prompts for vLLM (without special tokens - vLLM expects clean text)
         prompts_text_for_vllm = self.processing_class.batch_decode(
             inputs["prompts"],
-            skip_special_tokens=True,
+            skip_special_tokens=False,
             # clean_up_tokenization_spaces=False # Keep this commented unless specific issues arise
         )
         # Remove padding token text if it appears, as vLLM expects clean prompts
@@ -1981,7 +1988,7 @@ class GOLDTrainer(SFTTrainer):
                         unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                     )
                     new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
-
+    
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels

@@ -20,35 +20,6 @@
 # ]
 # ///
 
-# docstyle-ignore
-"""
-# Full training:
-python trl/experimental/gold/gold.py \
-    --model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
-    --teacher_model_name_or_path Qwen/Qwen2-1.5B-Instruct \
-    --dataset_name trl-lib/chatbot_arena_completions \
-    --learning_rate 2e-5 \
-    --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 8 \
-    --output_dir gold-model \
-    --num_train_epochs 1 \
-    --push_to_hub
-
-# LoRA:
-python trl/experimental/gold/gold.py \
-    --model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
-    --teacher_model_name_or_path Qwen/Qwen2-1.5B-Instruct \
-    --dataset_name trl-lib/chatbot_arena_completions \
-    --learning_rate 2e-4 \
-    --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 8 \
-    --output_dir gold-model \
-    --num_train_epochs 1 \
-    --push_to_hub \
-    --use_peft \
-    --lora_r 64 \
-    --lora_alpha 16
-"""
 
 import logging
 
@@ -64,15 +35,15 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.experimental.gold.gold_config import GOLDConfig
-from trl.experimental.gold.gold_trainer import GOLDTrainer
-
+from trl.experimental.cross_family_distillation.cross_family_distillation_config import CrossFamilyDistillConfig
+from trl.experimental.cross_family_distillation.cross_family_distillation_trainer import CrossFamilyPolicyDistillTrainer
+from trl.experimental.cross_family_distillation.eval_callbacks import VLLMMathEvalCallback
 
 logger = logging.getLogger(__name__)
 
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, GOLDConfig, ModelConfig))
+    parser = TrlParser((ScriptArguments, CrossFamilyDistillConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     
     ################
@@ -90,7 +61,7 @@ if __name__ == "__main__":
     )
     training_args.model_init_kwargs = model_kwargs
 
-    if training_args.teacher_tokenizer_name_or_path is None and training_args.use_uld_loss:
+    if training_args.teacher_tokenizer_name_or_path is None:
         training_args.teacher_tokenizer_name_or_path = training_args.teacher_model_name_or_path
     teacher_model_kwargs = dict(
         revision=model_args.model_revision,
@@ -131,7 +102,7 @@ if __name__ == "__main__":
         elif "dev" in dataset:
             eval_dataset = dataset["dev"]
 
-    trainer = GOLDTrainer(
+    trainer = CrossFamilyPolicyDistillTrainer(
         model=model_args.model_name_or_path,
         teacher_model=training_args.teacher_model_name_or_path,
         args=training_args,
@@ -141,6 +112,7 @@ if __name__ == "__main__":
         peft_config=get_peft_config(model_args),
     )
     
+
     if training_args.eval_strategy != "no":
         generation_config = GenerationConfig(
             max_new_tokens=training_args.max_completion_length, do_sample=True, temperature=training_args.temperature

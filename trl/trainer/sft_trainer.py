@@ -634,7 +634,7 @@ class SFTTrainer(BaseTrainer):
                     "You passed `model_init_kwargs` to the `SFTConfig`, but your model is already instantiated. "
                     "The `model_init_kwargs` will be ignored."
                 )
-
+        
         # Processing class
         if processing_class is None:
             processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
@@ -1014,7 +1014,7 @@ class SFTTrainer(BaseTrainer):
                 # Tokenize the dataset
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
-
+                
                 def tokenize_fn(example, processing_class, dataset_text_field, assistant_only_loss):
                     if "prompt" in example:  # prompt-completion case
                         output = {}
