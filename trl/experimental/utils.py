@@ -15,7 +15,7 @@
 # This file contains utility classes and functions that are used across more than one experimental trainer or feature.
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -126,6 +126,8 @@ class DataCollatorForChatML:
     max_length: int = None
     prompt_key: str = "prompt"
     messages_key: str = "messages"
+    enable_thinking: bool | None = None
+    _supports_enable_thinking: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self):
         if self.tokenizer.pad_token_id is None:
@@ -133,6 +135,21 @@ class DataCollatorForChatML:
         if self.max_length is None:
             # set a sensible default
             self.max_length = min(self.tokenizer.model_max_length, 1024)
+
+        try:
+            signature = inspect.signature(self.tokenizer.apply_chat_template)
+            has_var_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+            )
+            self._supports_enable_thinking = "enable_thinking" in signature.parameters or has_var_kwargs
+        except (TypeError, ValueError):
+            self._supports_enable_thinking = False
+
+    def _chat_template_kwargs(self, add_generation_prompt: bool) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"add_generation_prompt": add_generation_prompt, "tokenize": False}
+        if self.enable_thinking is not None and self._supports_enable_thinking:
+            kwargs["enable_thinking"] = self.enable_thinking
+        return kwargs
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         input_ids = []
@@ -145,15 +162,11 @@ class DataCollatorForChatML:
             formatted_prompt = example.get(self.prompt_key, None)
             if formatted_prompt is None:
                 prompt = example[self.messages_key][:-1]
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    prompt, add_generation_prompt=True, tokenize=False
-                )
+                formatted_prompt = self.tokenizer.apply_chat_template(prompt, **self._chat_template_kwargs(True))
 
             if "input_ids" not in example:
                 message = example[self.messages_key]
-                formatted_message = self.tokenizer.apply_chat_template(
-                    message, add_generation_prompt=False, tokenize=False
-                )
+                formatted_message = self.tokenizer.apply_chat_template(message, **self._chat_template_kwargs(False))
 
                 tokenized_message = self.tokenizer(
                     formatted_message,

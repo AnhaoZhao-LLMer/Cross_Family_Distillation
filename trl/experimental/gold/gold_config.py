@@ -39,6 +39,9 @@ class GOLDConfig(SFTConfig):
             beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL Divergence.
         max_completion_length (`int`, *optional*, defaults to `128`):
             Maximum number of tokens to generate per completion.
+        enable_thinking (`bool` or `None`, *optional*, defaults to `None`):
+            Optional flag forwarded to chat template/decode routines for models that support `enable_thinking`.
+            If `None`, keep tokenizer default behavior.
         teacher_model_name_or_path (`str` or `None`, *optional*, defaults to `None`):
             Model name or path of the teacher model. If `None`, the teacher model will be the same as the model being
             trained.
@@ -139,6 +142,12 @@ class GOLDConfig(SFTConfig):
     max_completion_length: int = field(
         default=128,
         metadata={"help": "Maximum number of tokens to generate per completion."},
+    )
+    enable_thinking: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Optional flag forwarded to tokenizer chat template/decode for models that support `enable_thinking`."
+        },
     )
     student_model_revision: str = field(
         default="main",

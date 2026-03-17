@@ -16,6 +16,7 @@ import os
 import random
 import textwrap
 import warnings
+import inspect
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -810,7 +811,11 @@ class GOLDTrainer(SFTTrainer):
 
         # Respect a user-provided data_collator; otherwise, provide a ChatML collator that
         if data_collator is None:
-            data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
+            data_collator = DataCollatorForChatML(
+                tokenizer=processing_class,
+                max_length=args.max_length,
+                enable_thinking=getattr(args, "enable_thinking", None),
+            )
 
         # Liger fused GKD loss (JSD)
         self.use_liger_gkd_loss = False
@@ -1142,6 +1147,26 @@ class GOLDTrainer(SFTTrainer):
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset (preserving original text)"
 
+            enable_thinking = getattr(args, "enable_thinking", None)
+            supports_enable_thinking = False
+            if enable_thinking is not None:
+                apply_chat_template_fn = getattr(processing_class, "apply_chat_template", None)
+                if apply_chat_template_fn is not None:
+                    try:
+                        signature = inspect.signature(apply_chat_template_fn)
+                        has_var_kwargs = any(
+                            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+                        )
+                        supports_enable_thinking = "enable_thinking" in signature.parameters or has_var_kwargs
+                    except (TypeError, ValueError):
+                        supports_enable_thinking = False
+
+            def _chat_template_kwargs(example: dict[str, Any]) -> dict[str, Any]:
+                kwargs = dict(example.get("chat_template_kwargs", {}))
+                if enable_thinking is not None and supports_enable_thinking:
+                    kwargs["enable_thinking"] = enable_thinking
+                return kwargs
+
             def tokenize_with_original_text(example, processing_class, dataset_text_field, assistant_only_loss):
                 """Modified tokenization function that preserves original text."""
                 result = {}
@@ -1152,13 +1177,14 @@ class GOLDTrainer(SFTTrainer):
                     result["original_completion_text"] = example["completion"]
 
                     if is_conversational(example):
+                        chat_template_kwargs = _chat_template_kwargs(example)
                         prompt_ids = processing_class.apply_chat_template(
-                            example["prompt"], return_dict=False, **example.get("chat_template_kwargs", {})
+                            example["prompt"], return_dict=False, **chat_template_kwargs
                         )
                         prompt_completion_ids = processing_class.apply_chat_template(
                             example["prompt"] + example["completion"],
                             return_dict=False,
-                            **example.get("chat_template_kwargs", {}),
+                            **chat_template_kwargs,
                         )
                     else:
                         prompt_ids = processing_class(text=example["prompt"]).input_ids
@@ -1195,12 +1221,13 @@ class GOLDTrainer(SFTTrainer):
                         assistant_messages = [msg for msg in messages if msg["role"] == "assistant"]
 
                         if user_messages and assistant_messages:
+                            chat_template_kwargs = _chat_template_kwargs(example)
                             # Apply chat template to get the prompt (everything up to assistant)
                             prompt_text = processing_class.apply_chat_template(
                                 user_messages,
                                 add_generation_prompt=True,  # add assistant prompt
                                 tokenize=False,
-                                **example.get("chat_template_kwargs", {}),
+                                **chat_template_kwargs,
                             )
 
                             # Get the full conversation with assistant response
@@ -1208,7 +1235,7 @@ class GOLDTrainer(SFTTrainer):
                                 messages,
                                 add_generation_prompt=False,
                                 tokenize=False,
-                                **example.get("chat_template_kwargs", {}),
+                                **chat_template_kwargs,
                             )
 
                             # Extract completion as everything after the prompt
@@ -1229,18 +1256,20 @@ class GOLDTrainer(SFTTrainer):
                             result["original_completion_text"] = completion_text
                         else:
                             # Fallback: use empty prompt and full text as completion
+                            chat_template_kwargs = _chat_template_kwargs(example)
                             full_text = processing_class.apply_chat_template(
-                                messages, tokenize=False, **example.get("chat_template_kwargs", {})
+                                messages, tokenize=False, **chat_template_kwargs
                             )
                             result["original_prompt_text"] = ""
                             result["original_completion_text"] = full_text
 
                         # Process the conversation normally
+                        chat_template_kwargs = _chat_template_kwargs(example)
                         processed = processing_class.apply_chat_template(
                             example["messages"],
                             return_dict=True,
                             return_assistant_tokens_mask=assistant_only_loss,
-                            **example.get("chat_template_kwargs", {}),
+                            **chat_template_kwargs,
                         )
                         if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
                             raise RuntimeError(
