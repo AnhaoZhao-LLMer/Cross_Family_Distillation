@@ -6,7 +6,7 @@ This project builds a filtered distillation dataset and then runs SFT.
 
 - Teacher: `/code/models/Qwen3-4B/`
 - Student: `/code/models/Qwen3-1.7B-Base/`
-- Source dataset: `/code/on_policy_distillation/trl/deepscaler_conversation.jsonl`
+- Source dataset: `/code/pruning_lrm_pipeline/Qwen2.5-Math/evaluation/data/deepscaler/train.jsonl`
 - Project root: `/code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill`
 
 ## Step 0: install dependencies
@@ -42,7 +42,5 @@ bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_dist
 ## Notes
 
 - Prompt rendering uses `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` when supported.
-- Verification is two-stage:
-  - Non-MCQ: math extraction (`Latex/Expr`) and `verify`.
-  - MCQ (`A-E`): string-only extraction and `verify`.
+- Verification uses `answer` field directly with `math-verify` (`parse` + `verify`).
 - SFT dataset format is conversational `messages` JSONL.

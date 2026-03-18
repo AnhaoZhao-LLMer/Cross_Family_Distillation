@@ -13,14 +13,8 @@ import inspect
 import json
 import os
 import random
-import re
 from datetime import datetime, timezone
 from pathlib import Path
-
-
-MCQ_LETTERS = ["A", "B", "C", "D", "E"]
-BOXED_MCQ_PATTERN = re.compile(r"\\boxed\s*\{\s*([A-E])\s*\}", flags=re.IGNORECASE)
-FINAL_MCQ_PATTERN = re.compile(r"(?:final answer|answer)\s*(?:is|:)?\s*([A-E])\b", flags=re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input_jsonl",
         type=str,
-        default="/code/on_policy_distillation/trl/deepscaler_conversation.jsonl",
-        help="Input dataset JSONL path. Expected format: {'messages': [...]}",
+        default="/code/pruning_lrm_pipeline/Qwen2.5-Math/evaluation/data/deepscaler/train.jsonl",
+        help="Input dataset path. Supports JSONL (one object per line) or JSON array file.",
     )
     parser.add_argument(
         "--teacher_model_path",
@@ -45,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample_size", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--question_field", type=str, default="problem")
+    parser.add_argument("--answer_field", type=str, default="answer")
+    parser.add_argument("--solution_field", type=str, default="solution")
     parser.add_argument("--max_new_tokens", type=int, default=5000)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.8)
@@ -64,48 +61,57 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_source_rows(input_jsonl: Path) -> tuple[list[dict], int]:
+def _load_json_or_jsonl(input_path: Path) -> list[dict]:
+    text = input_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text[0] == "[":
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+        return []
+
+    rows: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
+
+
+def load_source_rows(
+    input_jsonl: Path,
+    question_field: str,
+    answer_field: str,
+    solution_field: str,
+) -> tuple[list[dict], int]:
     rows: list[dict] = []
     skipped = 0
 
-    with input_jsonl.open("r", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                skipped += 1
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                skipped += 1
-                continue
+    all_rows = _load_json_or_jsonl(input_jsonl)
+    for idx, obj in enumerate(all_rows):
+        question = obj.get(question_field)
+        answer = obj.get(answer_field)
+        solution = obj.get(solution_field)
 
-            messages = obj.get("messages")
-            if not isinstance(messages, list):
-                skipped += 1
-                continue
+        if not isinstance(question, str) or not isinstance(answer, str):
+            skipped += 1
+            continue
 
-            question = None
-            gold = None
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                role = message.get("role")
-                content = message.get("content")
-                if not isinstance(content, str):
-                    continue
-                if question is None and role == "user":
-                    question = content
-                elif gold is None and role == "assistant":
-                    gold = content
-                if question is not None and gold is not None:
-                    break
-
-            if question is None or gold is None:
-                skipped += 1
-                continue
-
-            rows.append({"source_idx": idx, "question": question, "gold_answer": gold})
+        rows.append(
+            {
+                "source_idx": idx,
+                "question": question.strip(),
+                "gold_answer": answer.strip(),
+                "gold_solution": solution.strip() if isinstance(solution, str) else "",
+            }
+        )
 
     return rows, skipped
 
@@ -126,60 +132,45 @@ def build_prompt(tokenizer, question: str) -> tuple[str, bool]:
     return prompt, supports_enable_thinking
 
 
-def is_mcq_gold(gold_text: str) -> bool:
-    return bool(BOXED_MCQ_PATTERN.search(gold_text) or FINAL_MCQ_PATTERN.search(gold_text))
-
-
-def verify_two_stage(
+def verify_by_answer_only(
     parse,
     verify,
     latex_cfg_cls,
     expr_cfg_cls,
-    string_cfg_cls,
     normalization_cfg_cls,
-    gold_text: str,
+    gold_answer: str,
     pred_text: str,
-) -> tuple[bool, str, bool, bool, str]:
+) -> tuple[bool, bool, bool, str]:
     """
     Returns:
-      (is_correct, verifier_mode, gold_parse_failed, pred_parse_failed, error_message)
+      (is_correct, gold_parse_failed, pred_parse_failed, error_message)
     """
-    if is_mcq_gold(gold_text):
-        mode = "string_mcq"
-        try:
-            extraction_cfg = [string_cfg_cls(strings=MCQ_LETTERS)]
-            gold_parsed = parse(gold_text, extraction_config=extraction_cfg, extraction_mode="first_match")
-            pred_parsed = parse(pred_text, extraction_config=extraction_cfg, extraction_mode="first_match")
-            gold_failed = len(gold_parsed) == 0
-            pred_failed = len(pred_parsed) == 0
-            if gold_failed or pred_failed:
-                return False, mode, gold_failed, pred_failed, ""
-            return bool(verify(gold_parsed, pred_parsed)), mode, False, False, ""
-        except Exception as exc:  # noqa: BLE001
-            return False, mode, False, False, f"{type(exc).__name__}: {exc}"
-
-    mode = "latex_expr"
     try:
-        gold_parsed = parse(gold_text)
+        extraction_cfg = [
+            latex_cfg_cls(
+                normalization_config=normalization_cfg_cls(units=True),
+                boxed_match_priority=0,
+                try_extract_without_anchor=True,
+            ),
+            expr_cfg_cls(),
+        ]
+        gold_parsed = parse(
+            gold_answer,
+            extraction_config=extraction_cfg,
+            extraction_mode="first_match",
+        )
         pred_parsed = parse(
             pred_text,
-            extraction_config=[
-                latex_cfg_cls(
-                    normalization_config=normalization_cfg_cls(units=True),
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                ),
-                expr_cfg_cls(),
-            ],
+            extraction_config=extraction_cfg,
             extraction_mode="first_match",
         )
         gold_failed = len(gold_parsed) == 0
         pred_failed = len(pred_parsed) == 0
         if gold_failed or pred_failed:
-            return False, mode, gold_failed, pred_failed, ""
-        return bool(verify(gold_parsed, pred_parsed)), mode, False, False, ""
+            return False, gold_failed, pred_failed, ""
+        return bool(verify(gold_parsed, pred_parsed)), False, False, ""
     except Exception as exc:  # noqa: BLE001
-        return False, mode, False, False, f"{type(exc).__name__}: {exc}"
+        return False, False, False, f"{type(exc).__name__}: {exc}"
 
 
 def main() -> None:
@@ -189,7 +180,7 @@ def main() -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     from latex2sympy2_extended import NormalizationConfig
-    from math_verify import ExprExtractionConfig, LatexExtractionConfig, StringExtractionConfig, parse, verify
+    from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -204,7 +195,12 @@ def main() -> None:
     if not input_jsonl.exists():
         raise FileNotFoundError(f"Input JSONL does not exist: {input_jsonl}")
 
-    rows, skipped = load_source_rows(input_jsonl)
+    rows, skipped = load_source_rows(
+        input_jsonl=input_jsonl,
+        question_field=args.question_field,
+        answer_field=args.answer_field,
+        solution_field=args.solution_field,
+    )
     if not rows:
         raise ValueError(f"No valid rows found in {input_jsonl}")
 
@@ -244,6 +240,11 @@ def main() -> None:
         "sample_size_requested": args.sample_size,
         "sample_size_actual": sample_size,
         "seed": args.seed,
+        "input_schema": {
+            "question_field": args.question_field,
+            "answer_field": args.answer_field,
+            "solution_field": args.solution_field,
+        },
         "sampling_params": {
             "n": args.n,
             "temperature": args.temperature,
@@ -256,8 +257,6 @@ def main() -> None:
             "processed": 0,
             "correct": 0,
             "correct_rate": 0.0,
-            "mcq_samples": 0,
-            "latex_expr_samples": 0,
             "gold_parse_failed": 0,
             "pred_parse_failed": 0,
             "verification_errors": 0,
@@ -291,55 +290,19 @@ def main() -> None:
                 if not completions:
                     completions = [""]
 
+                # Keep logic simple: only evaluate the first completion.
                 selected_response = completions[0]
-                is_correct = False
-                verifier_mode = ""
-                gold_parse_failed = False
-                pred_parse_failed = False
-                verifier_error = ""
-
-                # If n > 1, keep the first correct completion if it exists.
-                for candidate_response in completions:
-                    (
-                        candidate_correct,
-                        candidate_mode,
-                        candidate_gold_failed,
-                        candidate_pred_failed,
-                        candidate_error,
-                    ) = verify_two_stage(
-                        parse=parse,
-                        verify=verify,
-                        latex_cfg_cls=LatexExtractionConfig,
-                        expr_cfg_cls=ExprExtractionConfig,
-                        string_cfg_cls=StringExtractionConfig,
-                        normalization_cfg_cls=NormalizationConfig,
-                        gold_text=item["gold_answer"],
-                        pred_text=candidate_response,
-                    )
-
-                    # Always record the first candidate state as fallback.
-                    if not verifier_mode:
-                        verifier_mode = candidate_mode
-                        gold_parse_failed = candidate_gold_failed
-                        pred_parse_failed = candidate_pred_failed
-                        verifier_error = candidate_error
-                        selected_response = candidate_response
-                        is_correct = candidate_correct
-
-                    if candidate_correct:
-                        verifier_mode = candidate_mode
-                        gold_parse_failed = candidate_gold_failed
-                        pred_parse_failed = candidate_pred_failed
-                        verifier_error = candidate_error
-                        selected_response = candidate_response
-                        is_correct = True
-                        break
+                is_correct, gold_parse_failed, pred_parse_failed, verifier_error = verify_by_answer_only(
+                    parse=parse,
+                    verify=verify,
+                    latex_cfg_cls=LatexExtractionConfig,
+                    expr_cfg_cls=ExprExtractionConfig,
+                    normalization_cfg_cls=NormalizationConfig,
+                    gold_answer=item["gold_answer"],
+                    pred_text=selected_response,
+                )
 
                 stats["generation"]["processed"] += 1
-                if verifier_mode == "string_mcq":
-                    stats["generation"]["mcq_samples"] += 1
-                else:
-                    stats["generation"]["latex_expr_samples"] += 1
                 if gold_parse_failed:
                     stats["generation"]["gold_parse_failed"] += 1
                 if pred_parse_failed:
@@ -353,9 +316,9 @@ def main() -> None:
                     "source_idx": item["source_idx"],
                     "question": item["question"],
                     "gold_answer": item["gold_answer"],
+                    "gold_solution": item["gold_solution"],
                     "teacher_response": selected_response,
                     "is_correct": is_correct,
-                    "verifier_mode": verifier_mode,
                     "gold_parse_failed": gold_parse_failed,
                     "pred_parse_failed": pred_parse_failed,
                     "verifier_error": verifier_error,
@@ -370,7 +333,7 @@ def main() -> None:
                         ],
                         "meta": {
                             "source_idx": item["source_idx"],
-                            "verifier_mode": verifier_mode,
+                            "gold_answer": item["gold_answer"],
                         },
                     }
                     filtered_f.write(json.dumps(filtered_row, ensure_ascii=False) + "\n")

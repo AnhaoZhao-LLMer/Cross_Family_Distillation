@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="/code/on_policy_distillation/trl"
 PROJECT_ROOT="/code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill"
-INPUT_JSONL="/code/on_policy_distillation/trl/deepscaler_conversation.jsonl"
+INPUT_JSONL="/code/pruning_lrm_pipeline/Qwen2.5-Math/evaluation/data/deepscaler/train.jsonl"
 TEACHER_MODEL_PATH="/code/models/Qwen3-4B/"
 OUTPUT_DIR="${PROJECT_ROOT}/data"
 
@@ -19,6 +19,9 @@ python "${PROJECT_ROOT}/scripts/build_distill_dataset.py" \
   --output_dir "${OUTPUT_DIR}" \
   --sample_size 10000 \
   --seed 42 \
+  --question_field problem \
+  --answer_field answer \
+  --solution_field solution \
   --max_new_tokens 5000 \
   --temperature 0.7 \
   --top_p 0.8 \
