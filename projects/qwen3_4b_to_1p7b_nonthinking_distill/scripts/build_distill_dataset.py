@@ -3,7 +3,7 @@
 Build an offline distillation dataset by:
 1) sampling prompts from a source JSONL dataset,
 2) generating teacher responses with vLLM in non-thinking mode, and
-3) keeping only math-verified correct responses.
+3) keeping only responses whose last boxed answer matches the gold answer.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--question_field", type=str, default="problem")
     parser.add_argument("--answer_field", type=str, default="answer")
-    parser.add_argument("--solution_field", type=str, default="solution")
     parser.add_argument("--max_new_tokens", type=int, default=5000)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.8)
@@ -89,7 +88,6 @@ def load_source_rows(
     input_jsonl: Path,
     question_field: str,
     answer_field: str,
-    solution_field: str,
 ) -> tuple[list[dict], int]:
     rows: list[dict] = []
     skipped = 0
@@ -98,7 +96,6 @@ def load_source_rows(
     for idx, obj in enumerate(all_rows):
         question = obj.get(question_field)
         answer = obj.get(answer_field)
-        solution = obj.get(solution_field)
 
         if not isinstance(question, str) or not isinstance(answer, str):
             skipped += 1
@@ -109,7 +106,6 @@ def load_source_rows(
                 "source_idx": idx,
                 "question": question.strip(),
                 "gold_answer": answer.strip(),
-                "gold_solution": solution.strip() if isinstance(solution, str) else "",
             }
         )
 
@@ -132,45 +128,42 @@ def build_prompt(tokenizer, question: str) -> tuple[str, bool]:
     return prompt, supports_enable_thinking
 
 
-def verify_by_answer_only(
-    parse,
-    verify,
-    latex_cfg_cls,
-    expr_cfg_cls,
-    normalization_cfg_cls,
-    gold_answer: str,
-    pred_text: str,
-) -> tuple[bool, bool, bool, str]:
-    """
-    Returns:
-      (is_correct, gold_parse_failed, pred_parse_failed, error_message)
-    """
-    try:
-        extraction_cfg = [
-            latex_cfg_cls(
-                normalization_config=normalization_cfg_cls(units=True),
-                boxed_match_priority=0,
-                try_extract_without_anchor=True,
-            ),
-            expr_cfg_cls(),
-        ]
-        gold_parsed = parse(
-            gold_answer,
-            extraction_config=extraction_cfg,
-            extraction_mode="first_match",
-        )
-        pred_parsed = parse(
-            pred_text,
-            extraction_config=extraction_cfg,
-            extraction_mode="first_match",
-        )
-        gold_failed = len(gold_parsed) == 0
-        pred_failed = len(pred_parsed) == 0
-        if gold_failed or pred_failed:
-            return False, gold_failed, pred_failed, ""
-        return bool(verify(gold_parsed, pred_parsed)), False, False, ""
-    except Exception as exc:  # noqa: BLE001
-        return False, False, False, f"{type(exc).__name__}: {exc}"
+def extract_last_boxed(text: str) -> str:
+    if not text:
+        return ""
+    pos = 0
+    last = ""
+    while True:
+        idx = text.find("\\boxed", pos)
+        if idx < 0:
+            break
+        brace_start = text.find("{", idx)
+        if brace_start < 0:
+            pos = idx + 6
+            continue
+
+        depth = 0
+        for i in range(brace_start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    last = text[brace_start + 1 : i].strip()
+                    break
+        pos = idx + 6
+    return last
+
+
+def normalize_answer(text: str) -> str:
+    s = text.strip()
+    if s.startswith("$") and s.endswith("$") and len(s) >= 2:
+        s = s[1:-1].strip()
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("\u2212", "-")
+    s = "".join(s.split())
+    return s
 
 
 def main() -> None:
@@ -179,8 +172,6 @@ def main() -> None:
     if args.gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    from latex2sympy2_extended import NormalizationConfig
-    from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -199,7 +190,6 @@ def main() -> None:
         input_jsonl=input_jsonl,
         question_field=args.question_field,
         answer_field=args.answer_field,
-        solution_field=args.solution_field,
     )
     if not rows:
         raise ValueError(f"No valid rows found in {input_jsonl}")
@@ -243,7 +233,6 @@ def main() -> None:
         "input_schema": {
             "question_field": args.question_field,
             "answer_field": args.answer_field,
-            "solution_field": args.solution_field,
         },
         "sampling_params": {
             "n": args.n,
@@ -257,9 +246,7 @@ def main() -> None:
             "processed": 0,
             "correct": 0,
             "correct_rate": 0.0,
-            "gold_parse_failed": 0,
-            "pred_parse_failed": 0,
-            "verification_errors": 0,
+            "boxed_not_found": 0,
             "chat_template_enable_thinking_supported": None,
         },
         "outputs": {
@@ -292,23 +279,14 @@ def main() -> None:
 
                 # Keep logic simple: only evaluate the first completion.
                 selected_response = completions[0]
-                is_correct, gold_parse_failed, pred_parse_failed, verifier_error = verify_by_answer_only(
-                    parse=parse,
-                    verify=verify,
-                    latex_cfg_cls=LatexExtractionConfig,
-                    expr_cfg_cls=ExprExtractionConfig,
-                    normalization_cfg_cls=NormalizationConfig,
-                    gold_answer=item["gold_answer"],
-                    pred_text=selected_response,
+                pred_boxed = extract_last_boxed(selected_response)
+                if not pred_boxed:
+                    stats["generation"]["boxed_not_found"] += 1
+                is_correct = bool(pred_boxed) and (
+                    normalize_answer(pred_boxed) == normalize_answer(item["gold_answer"])
                 )
 
                 stats["generation"]["processed"] += 1
-                if gold_parse_failed:
-                    stats["generation"]["gold_parse_failed"] += 1
-                if pred_parse_failed:
-                    stats["generation"]["pred_parse_failed"] += 1
-                if verifier_error:
-                    stats["generation"]["verification_errors"] += 1
                 if is_correct:
                     stats["generation"]["correct"] += 1
 
@@ -316,12 +294,9 @@ def main() -> None:
                     "source_idx": item["source_idx"],
                     "question": item["question"],
                     "gold_answer": item["gold_answer"],
-                    "gold_solution": item["gold_solution"],
                     "teacher_response": selected_response,
+                    "teacher_boxed_answer": pred_boxed,
                     "is_correct": is_correct,
-                    "gold_parse_failed": gold_parse_failed,
-                    "pred_parse_failed": pred_parse_failed,
-                    "verifier_error": verifier_error,
                 }
                 all_f.write(json.dumps(all_row, ensure_ascii=False) + "\n")
 

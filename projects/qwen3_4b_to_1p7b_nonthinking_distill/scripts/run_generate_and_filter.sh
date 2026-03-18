@@ -21,7 +21,6 @@ python "${PROJECT_ROOT}/scripts/build_distill_dataset.py" \
   --seed 42 \
   --question_field problem \
   --answer_field answer \
-  --solution_field solution \
   --max_new_tokens 5000 \
   --temperature 0.7 \
   --top_p 0.8 \

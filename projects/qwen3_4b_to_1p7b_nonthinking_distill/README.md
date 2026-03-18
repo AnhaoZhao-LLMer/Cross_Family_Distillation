@@ -15,8 +15,6 @@ At minimum, ensure these packages are available in your runtime:
 
 - `vllm`
 - `transformers`
-- `math-verify`
-- `latex2sympy2_extended`
 - `datasets`
 - `accelerate`
 - local `trl` source (this repo)
@@ -42,5 +40,5 @@ bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_dist
 ## Notes
 
 - Prompt rendering uses `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` when supported.
-- Verification uses `answer` field directly with `math-verify` (`parse` + `verify`).
+- Verification uses `answer` field directly and compares to the extracted last `\boxed{...}` content.
 - SFT dataset format is conversational `messages` JSONL.
