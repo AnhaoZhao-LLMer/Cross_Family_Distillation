@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all_generations_filename", type=str, default="all_generations.jsonl")
     parser.add_argument("--filtered_filename", type=str, default="filtered_correct_messages_10k.jsonl")
     parser.add_argument("--stats_filename", type=str, default="stats.json")
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from existing jsonl files if they exist.",
+    )
     return parser.parse_args()
 
 
@@ -173,6 +179,34 @@ def normalize_answer(text: str) -> str:
     return s
 
 
+def load_existing_progress(all_path: Path, filtered_path: Path) -> tuple[set[int], set[int]]:
+    processed_source_idx: set[int] = set()
+    correct_source_idx: set[int] = set()
+
+    if all_path.exists():
+        with all_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                source_idx = obj.get("source_idx")
+                if isinstance(source_idx, int):
+                    processed_source_idx.add(source_idx)
+                    if bool(obj.get("is_correct")):
+                        correct_source_idx.add(source_idx)
+
+    # If filtered exists but all doesn't, we still rely on all file for source_idx dedup.
+    # Keeping this check for visibility only.
+    if filtered_path.exists() and not all_path.exists():
+        print(f"[WARN] {filtered_path} exists but {all_path} does not. Resume dedup may be incomplete.")
+
+    return processed_source_idx, correct_source_idx
+
+
 def compare_boxed_answer(
     gold_answer: str,
     pred_boxed: str,
@@ -242,10 +276,23 @@ def main() -> None:
     sample_size = min(args.sample_size, len(rows))
     rng = random.Random(args.seed)
     sampled = rng.sample(rows, k=sample_size)
+    sampled_source_idx = {item["source_idx"] for item in sampled}
+
+    existing_processed_idx: set[int] = set()
+    existing_correct_idx: set[int] = set()
+    if args.resume:
+        existing_processed_idx, existing_correct_idx = load_existing_progress(all_path, filtered_path)
+        # Keep only idx that belong to this sampled subset.
+        existing_processed_idx = existing_processed_idx.intersection(sampled_source_idx)
+        existing_correct_idx = existing_correct_idx.intersection(sampled_source_idx)
+    to_process = [item for item in sampled if item["source_idx"] not in existing_processed_idx]
 
     print(f"[INFO] Loaded rows: {len(rows)} (skipped: {skipped})")
     print(f"[INFO] Sampled rows: {sample_size} (seed={args.seed})")
     print(f"[INFO] Teacher model: {args.teacher_model_path}")
+    if args.resume:
+        print(f"[INFO] Resume enabled: already_done_in_sample={len(existing_processed_idx)}")
+    print(f"[INFO] Remaining to process: {len(to_process)}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_path, trust_remote_code=args.trust_remote_code)
     llm = LLM(
@@ -275,6 +322,8 @@ def main() -> None:
         "sample_size_requested": args.sample_size,
         "sample_size_actual": sample_size,
         "seed": args.seed,
+        "resume": args.resume,
+        "existing_processed_in_sample": len(existing_processed_idx),
         "input_schema": {
             "question_field": args.question_field,
             "answer_field": args.answer_field,
@@ -289,8 +338,8 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
         },
         "generation": {
-            "processed": 0,
-            "correct": 0,
+            "processed": len(existing_processed_idx),
+            "correct": len(existing_correct_idx),
             "correct_rate": 0.0,
             "boxed_not_found": 0,
             "chat_template_enable_thinking_supported": None,
@@ -302,69 +351,80 @@ def main() -> None:
         },
     }
 
-    with all_path.open("w", encoding="utf-8") as all_f, filtered_path.open("w", encoding="utf-8") as filtered_f:
-        for start in range(0, sample_size, args.batch_size):
-            batch = sampled[start : start + args.batch_size]
-            prompts = []
-            support_flags = []
+    all_mode = "a" if args.resume and all_path.exists() else "w"
+    filtered_mode = "a" if args.resume and filtered_path.exists() else "w"
 
-            for item in batch:
-                prompt, supports_enable_thinking = build_prompt(tokenizer, item["question"])
-                prompts.append(prompt)
-                support_flags.append(supports_enable_thinking)
+    try:
+        with all_path.open(all_mode, encoding="utf-8") as all_f, filtered_path.open(
+            filtered_mode, encoding="utf-8"
+        ) as filtered_f:
+            for start in range(0, len(to_process), args.batch_size):
+                batch = to_process[start : start + args.batch_size]
+                prompts = []
+                support_flags = []
 
-            if stats["generation"]["chat_template_enable_thinking_supported"] is None and support_flags:
-                stats["generation"]["chat_template_enable_thinking_supported"] = support_flags[0]
+                for item in batch:
+                    prompt, supports_enable_thinking = build_prompt(tokenizer, item["question"])
+                    prompts.append(prompt)
+                    support_flags.append(supports_enable_thinking)
 
-            outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+                if stats["generation"]["chat_template_enable_thinking_supported"] is None and support_flags:
+                    stats["generation"]["chat_template_enable_thinking_supported"] = support_flags[0]
 
-            for item, output in zip(batch, outputs, strict=True):
-                completions = [candidate.text for candidate in output.outputs]
-                if not completions:
-                    completions = [""]
+                outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
 
-                # Keep logic simple: only evaluate the first completion.
-                selected_response = completions[0]
-                pred_boxed = extract_last_boxed(selected_response)
-                if not pred_boxed:
-                    stats["generation"]["boxed_not_found"] += 1
-                is_correct = compare_boxed_answer(
-                    gold_answer=item["gold_answer"],
-                    pred_boxed=pred_boxed,
-                    compare_mode=args.boxed_compare_mode,
-                    parse=parse,
-                    verify=verify,
-                )
+                for item, output in zip(batch, outputs, strict=True):
+                    completions = [candidate.text for candidate in output.outputs]
+                    if not completions:
+                        completions = [""]
 
-                stats["generation"]["processed"] += 1
-                if is_correct:
-                    stats["generation"]["correct"] += 1
+                    # Keep logic simple: only evaluate the first completion.
+                    selected_response = completions[0]
+                    pred_boxed = extract_last_boxed(selected_response)
+                    if not pred_boxed:
+                        stats["generation"]["boxed_not_found"] += 1
+                    is_correct = compare_boxed_answer(
+                        gold_answer=item["gold_answer"],
+                        pred_boxed=pred_boxed,
+                        compare_mode=args.boxed_compare_mode,
+                        parse=parse,
+                        verify=verify,
+                    )
 
-                all_row = {
-                    "source_idx": item["source_idx"],
-                    "question": item["question"],
-                    "gold_answer": item["gold_answer"],
-                    "teacher_response": selected_response,
-                    "teacher_boxed_answer": pred_boxed,
-                    "is_correct": is_correct,
-                }
-                all_f.write(json.dumps(all_row, ensure_ascii=False) + "\n")
+                    stats["generation"]["processed"] += 1
+                    if is_correct:
+                        stats["generation"]["correct"] += 1
 
-                if is_correct:
-                    filtered_row = {
-                        "messages": [
-                            {"role": "user", "content": item["question"]},
-                            {"role": "assistant", "content": selected_response},
-                        ],
-                        "meta": {
-                            "source_idx": item["source_idx"],
-                            "gold_answer": item["gold_answer"],
-                        },
+                    all_row = {
+                        "source_idx": item["source_idx"],
+                        "question": item["question"],
+                        "gold_answer": item["gold_answer"],
+                        "teacher_response": selected_response,
+                        "teacher_boxed_answer": pred_boxed,
+                        "is_correct": is_correct,
                     }
-                    filtered_f.write(json.dumps(filtered_row, ensure_ascii=False) + "\n")
+                    all_f.write(json.dumps(all_row, ensure_ascii=False) + "\n")
 
-            processed = stats["generation"]["processed"]
-            print(f"[INFO] Processed {processed}/{sample_size}")
+                    if is_correct:
+                        filtered_row = {
+                            "messages": [
+                                {"role": "user", "content": item["question"]},
+                                {"role": "assistant", "content": selected_response},
+                            ],
+                            "meta": {
+                                "source_idx": item["source_idx"],
+                                "gold_answer": item["gold_answer"],
+                            },
+                        }
+                        filtered_f.write(json.dumps(filtered_row, ensure_ascii=False) + "\n")
+
+                # Periodic durability for Ctrl+C and crashes.
+                all_f.flush()
+                filtered_f.flush()
+                processed = stats["generation"]["processed"]
+                print(f"[INFO] Processed {processed}/{sample_size}")
+    except KeyboardInterrupt:
+        print("[WARN] Interrupted by user (Ctrl+C). Saving partial progress and stats...")
 
     if stats["generation"]["processed"] > 0:
         stats["generation"]["correct_rate"] = (

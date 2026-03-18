@@ -43,6 +43,7 @@ bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_dist
 - Prompt rendering uses `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` when supported.
 - Verification extracts the last `\boxed{...}` from teacher response and compares to `answer`.
 - Default mode is `--boxed_compare_mode math` (uses `math-verify`), so equivalent forms like `-1.375` and `-\frac{11}{8}` can match.
+- `build_distill_dataset.py` defaults to `--resume`, so reruns append and skip already processed `source_idx`.
 - SFT dataset format is conversational `messages` JSONL.
 
 ### Quick equivalence check
