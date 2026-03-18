@@ -893,6 +893,8 @@ class GOLDTrainer(SFTTrainer):
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.seq_kd = args.seq_kd
+        self.distill_loss_type = getattr(args, "distill_loss_type", "jsd")
+        self.reverse_kl_topk = int(getattr(args, "reverse_kl_topk", 1))
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
@@ -1420,7 +1422,47 @@ class GOLDTrainer(SFTTrainer):
         else:
             return jsd
 
+    @staticmethod
+    def reverse_kl_topk_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor, topk: int) -> torch.Tensor:
+        """
+        Compute a reverse-KL-style top-k distillation loss over valid (`labels != -100`) positions.
+
+        For topk=1, uses rollout tokens from `labels`:
+            p_s(y_t) * (log p_s(y_t) - log p_t(y_t))
+
+        For topk>1, uses student top-k tokens:
+            sum_{i in topk} p_s(i) * (log p_s(i) - log p_t(i))
+        """
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_probs = student_log_probs.exp()
+
+        valid_mask = labels != -100
+        if not valid_mask.any():
+            return student_logits.new_tensor(0.0)
+
+        if topk == 1:
+            safe_labels = labels.clone()
+            safe_labels[~valid_mask] = 0
+            gathered_student_probs = student_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+            gathered_student_log_probs = student_log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+            gathered_teacher_log_probs = teacher_log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+            per_token_loss = gathered_student_probs * (gathered_student_log_probs - gathered_teacher_log_probs)
+        else:
+            effective_topk = min(topk, student_logits.size(-1))
+            topk_indices = torch.topk(student_probs, k=effective_topk, dim=-1).indices
+            topk_student_probs = student_probs.gather(-1, topk_indices)
+            topk_student_log_probs = student_log_probs.gather(-1, topk_indices)
+            topk_teacher_log_probs = teacher_log_probs.gather(-1, topk_indices)
+            per_token_loss = (topk_student_probs * (topk_student_log_probs - topk_teacher_log_probs)).sum(dim=-1)
+
+        return per_token_loss[valid_mask].mean()
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.distill_loss_type == "reverse_kl_topk" and (self.use_uld_loss or self.use_liger_gkd_loss):
+            raise ValueError(
+                "distill_loss_type='reverse_kl_topk' is only supported in the standard (non-ULD, non-Liger) loss path."
+            )
 
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
@@ -1554,12 +1596,20 @@ class GOLDTrainer(SFTTrainer):
                 shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
                 shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
                 shifted_labels = inputs["labels"][:, prompt_lengths:]
-                loss = self.generalized_jsd_loss(
-                    student_logits=shifted_student_logits,
-                    teacher_logits=shifted_teacher_logits,
-                    labels=shifted_labels,
-                    beta=self.beta,
-                )
+                if self.distill_loss_type == "reverse_kl_topk":
+                    loss = self.reverse_kl_topk_loss(
+                        student_logits=shifted_student_logits,
+                        teacher_logits=shifted_teacher_logits,
+                        labels=shifted_labels,
+                        topk=self.reverse_kl_topk,
+                    )
+                else:
+                    loss = self.generalized_jsd_loss(
+                        student_logits=shifted_student_logits,
+                        teacher_logits=shifted_teacher_logits,
+                        labels=shifted_labels,
+                        beta=self.beta,
+                    )
 
         if self.use_uld_loss:
             student_input_ids = inputs["input_ids"]

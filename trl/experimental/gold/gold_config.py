@@ -39,6 +39,12 @@ class GOLDConfig(SFTConfig):
             beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL Divergence.
         max_completion_length (`int`, *optional*, defaults to `128`):
             Maximum number of tokens to generate per completion.
+        distill_loss_type (`str`, *optional*, defaults to `"jsd"`):
+            Distillation loss type. `"jsd"` keeps the original full-vocabulary generalized JSD objective, while
+            `"reverse_kl_topk"` enables reverse-KL-style top-k distillation on on-policy rollouts.
+        reverse_kl_topk (`int`, *optional*, defaults to `1`):
+            Number of student-selected tokens used by `distill_loss_type="reverse_kl_topk"`. `1` corresponds to
+            rollout-token-only mode.
         enable_thinking (`bool` or `None`, *optional*, defaults to `None`):
             Optional flag forwarded to chat template/decode routines for models that support `enable_thinking`.
             If `None`, keep tokenizer default behavior.
@@ -142,6 +148,16 @@ class GOLDConfig(SFTConfig):
     max_completion_length: int = field(
         default=128,
         metadata={"help": "Maximum number of tokens to generate per completion."},
+    )
+    distill_loss_type: str = field(
+        default="jsd",
+        metadata={
+            "help": 'Distillation loss type. Use "jsd" (default) or "reverse_kl_topk" for reverse-KL-style top-k distillation.'
+        },
+    )
+    reverse_kl_topk: int = field(
+        default=1,
+        metadata={"help": 'Top-k used by `distill_loss_type="reverse_kl_topk"`. Must be >= 1.'},
     )
     enable_thinking: bool | None = field(
         default=None,
@@ -385,6 +401,22 @@ class GOLDConfig(SFTConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        valid_distill_loss_types = {"jsd", "reverse_kl_topk"}
+        if self.distill_loss_type not in valid_distill_loss_types:
+            raise ValueError(
+                f"distill_loss_type must be one of {sorted(valid_distill_loss_types)}. Got: {self.distill_loss_type}"
+            )
+        if self.reverse_kl_topk < 1:
+            raise ValueError("reverse_kl_topk must be >= 1.")
+
+        if self.distill_loss_type == "reverse_kl_topk":
+            if self.lmbda != 1.0:
+                raise ValueError("distill_loss_type='reverse_kl_topk' requires lmbda=1.0 (on-policy only).")
+            if self.use_uld_loss:
+                raise ValueError("distill_loss_type='reverse_kl_topk' does not support use_uld_loss=True.")
+            if self.use_liger_kernel:
+                raise ValueError("distill_loss_type='reverse_kl_topk' does not support use_liger_kernel=True.")
+
         # check lmbda and beta are in the range [0, 1]
         if self.lmbda < 0.0 or self.lmbda > 1.0:
             raise ValueError("lmbda must be in the range [0.0, 1.0].")

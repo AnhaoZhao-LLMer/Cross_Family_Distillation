@@ -1,0 +1,4 @@
+datasets:
+  - path: json
+    data_files: /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/data/filtered_correct_messages_10k.jsonl
+    split: train
