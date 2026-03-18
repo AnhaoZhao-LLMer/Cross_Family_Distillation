@@ -41,6 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--question_field", type=str, default="problem")
     parser.add_argument("--answer_field", type=str, default="answer")
+    parser.add_argument(
+        "--boxed_compare_mode",
+        type=str,
+        choices=["string", "math"],
+        default="math",
+        help="How to compare boxed answer with gold answer.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=5000)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.8)
@@ -166,6 +173,32 @@ def normalize_answer(text: str) -> str:
     return s
 
 
+def compare_boxed_answer(
+    gold_answer: str,
+    pred_boxed: str,
+    compare_mode: str,
+    parse=None,
+    verify=None,
+) -> bool:
+    if not pred_boxed:
+        return False
+
+    if compare_mode == "string":
+        return normalize_answer(pred_boxed) == normalize_answer(gold_answer)
+
+    # compare_mode == "math"
+    if parse is None or verify is None:
+        raise ValueError("math compare mode requires math_verify parse/verify functions.")
+    try:
+        gold_parsed = parse(gold_answer)
+        pred_parsed = parse(pred_boxed)
+        if len(gold_parsed) == 0 or len(pred_parsed) == 0:
+            return False
+        return bool(verify(gold_parsed, pred_parsed))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> None:
     args = parse_args()
 
@@ -174,6 +207,18 @@ def main() -> None:
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
+
+    parse = None
+    verify = None
+    if args.boxed_compare_mode == "math":
+        try:
+            from math_verify import parse as mv_parse, verify as mv_verify
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "boxed_compare_mode=math requires math_verify. Install it with `pip install math-verify`."
+            ) from exc
+        parse = mv_parse
+        verify = mv_verify
 
     input_jsonl = Path(args.input_jsonl)
     output_dir = Path(args.output_dir)
@@ -234,6 +279,7 @@ def main() -> None:
             "question_field": args.question_field,
             "answer_field": args.answer_field,
         },
+        "boxed_compare_mode": args.boxed_compare_mode,
         "sampling_params": {
             "n": args.n,
             "temperature": args.temperature,
@@ -282,8 +328,12 @@ def main() -> None:
                 pred_boxed = extract_last_boxed(selected_response)
                 if not pred_boxed:
                     stats["generation"]["boxed_not_found"] += 1
-                is_correct = bool(pred_boxed) and (
-                    normalize_answer(pred_boxed) == normalize_answer(item["gold_answer"])
+                is_correct = compare_boxed_answer(
+                    gold_answer=item["gold_answer"],
+                    pred_boxed=pred_boxed,
+                    compare_mode=args.boxed_compare_mode,
+                    parse=parse,
+                    verify=verify,
                 )
 
                 stats["generation"]["processed"] += 1
