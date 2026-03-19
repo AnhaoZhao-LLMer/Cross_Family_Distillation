@@ -38,6 +38,16 @@ Outputs (under `data/`):
 bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/scripts/run_sft_qwen3_1p7b.sh
 ```
 
+## Optional: truncate assistant completion length before SFT
+
+```bash
+bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/scripts/run_truncate_completion.sh
+```
+
+This writes:
+
+- `/code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/data/filtered_correct_messages_10k_trunc_c1024.jsonl`
+
 ## Notes
 
 - Prompt rendering uses `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` when supported.

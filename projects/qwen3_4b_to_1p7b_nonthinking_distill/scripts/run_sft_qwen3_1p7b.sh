@@ -47,5 +47,6 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python trl/scripts/sft.py \
   --seed 42 \
   --warmup_ratio 0.05 \
   --lr_scheduler_type cosine_with_min_lr \
+  --lr_scheduler_kwargs '{"min_lr_rate": 0.1}' \
   --run_name "${RUN_NAME}" \
   --trust_remote_code True
