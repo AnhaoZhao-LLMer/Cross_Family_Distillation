@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import gc
 import inspect
+import json
 import os
 import random
 import time
@@ -54,6 +55,9 @@ class VLLMEvalArguments:
     vllm_eval_dtype: str = field(default="auto", metadata={"help": "vLLM dtype."})
     vllm_eval_max_model_len: int = field(default=8192, metadata={"help": "vLLM max model len."})
     vllm_eval_gpu_memory_utilization: float = field(default=0.9, metadata={"help": "vLLM GPU memory utilization."})
+    vllm_eval_on_train_begin: bool = field(
+        default=True, metadata={"help": "Run one baseline vLLM eval before training updates."}
+    )
 
 
 def extract_last_boxed(text: str) -> str:
@@ -84,11 +88,21 @@ def extract_last_boxed(text: str) -> str:
     return last
 
 
+def extract_after_hashes(text: str) -> str:
+    if not text:
+        return ""
+    if "####" in text:
+        return text.split("####")[-1].strip()
+    return ""
+
+
 class SFTVLLMMathEvalCallback(TrainerCallback):
-    def __init__(self, trainer: SFTTrainer, eval_args: VLLMEvalArguments):
+    def __init__(self, trainer: SFTTrainer, eval_args: VLLMEvalArguments, base_model_path: str):
         self.trainer = trainer
         self.eval_args = eval_args
+        self.base_model_path = base_model_path
         self._last_eval_step = -1
+        self._initial_eval_done = False
 
         try:
             from math_verify import parse, verify
@@ -99,6 +113,8 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
 
         self._supports_enable_thinking = self._check_enable_thinking_support()
         self.all_test_data = self._load_all_eval_data()
+        self.eval_output_dir = Path(self.trainer.args.output_dir) / "eval_outputs"
+        self.eval_output_dir.mkdir(parents=True, exist_ok=True)
 
     def _check_enable_thinking_support(self) -> bool:
         try:
@@ -125,7 +141,9 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
         for key in ("answer", "gold"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
+                value = value.strip()
+                # GSM8K-style answer often stores final numeric result after "####".
+                return extract_after_hashes(value) or value
         return ""
 
     def _load_all_eval_data(self) -> dict[str, list[dict]]:
@@ -186,11 +204,11 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
         messages = [{"role": "user", "content": question}]
         kwargs = {"tokenize": False, "add_generation_prompt": True}
         if self._supports_enable_thinking:
-            kwargs["enable_thinking"] = True
+            kwargs["enable_thinking"] = False
         return self.trainer.processing_class.apply_chat_template(messages, **kwargs)
 
     def _is_correct(self, gold: str, pred_text: str) -> bool:
-        candidate = extract_last_boxed(pred_text) or pred_text
+        candidate = extract_last_boxed(pred_text) or extract_after_hashes(pred_text) or pred_text
         try:
             gold_parsed = self._parse(gold)
             pred_parsed = self._parse(candidate)
@@ -204,6 +222,16 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
         from vllm import LLM
 
         original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if self.eval_args.vllm_eval_gpu and original_cuda_visible_devices:
+            visible = [x.strip() for x in original_cuda_visible_devices.split(",") if x.strip()]
+            if self.eval_args.vllm_eval_gpu not in visible:
+                raise RuntimeError(
+                    "Invalid vLLM eval GPU mapping: "
+                    f"vllm_eval_gpu={self.eval_args.vllm_eval_gpu} is not in current "
+                    f"CUDA_VISIBLE_DEVICES={original_cuda_visible_devices}. "
+                    "Use a valid visible GPU id, or launch training with a CUDA_VISIBLE_DEVICES list that includes it."
+                )
+
         if self.eval_args.vllm_eval_gpu:
             os.environ["CUDA_VISIBLE_DEVICES"] = self.eval_args.vllm_eval_gpu
 
@@ -212,7 +240,6 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
                 model=model_path,
                 tensor_parallel_size=self.eval_args.vllm_eval_tensor_parallel_size,
                 dtype=self.eval_args.vllm_eval_dtype,
-                trust_remote_code=True,
                 max_model_len=self.eval_args.vllm_eval_max_model_len,
                 gpu_memory_utilization=self.eval_args.vllm_eval_gpu_memory_utilization,
             )
@@ -224,17 +251,19 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
 
         return engine
 
-    def _run_eval_once(self, state_step: int) -> None:
-        checkpoint_path = self._find_latest_checkpoint()
-        if checkpoint_path is None:
-            logger.warning("Skip vLLM eval: no checkpoint found under output_dir yet.")
-            return
+    def _run_eval_once(self, state_step: int, model_path: str | None = None) -> None:
+        if model_path is None:
+            model_path = self._find_latest_checkpoint()
+            if model_path is None:
+                logger.warning("Skip vLLM eval: no checkpoint found under output_dir yet.")
+                return
 
         from vllm import SamplingParams
 
-        logger.info(f"Starting vLLM eval at step={state_step}, checkpoint={checkpoint_path}")
+        logger.info(f"Starting vLLM eval at step={state_step}, model={model_path}")
         eval_start = time.time()
-        engine = self._create_vllm_engine(checkpoint_path)
+        engine = self._create_vllm_engine(model_path)
+        details_rows: list[dict] = []
         sampling_params = SamplingParams(
             n=self.eval_args.vllm_eval_n,
             temperature=self.eval_args.vllm_eval_temperature,
@@ -249,14 +278,43 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
 
             correct = 0
             total_len = 0
-            for item, output in zip(data, outputs, strict=True):
+            for sample_idx, (item, output) in enumerate(zip(data, outputs, strict=True)):
+                selected_text = ""
+                selected_len = 0
                 any_correct = False
-                for candidate in output.outputs:
-                    total_len += len(candidate.token_ids)
-                    if self._is_correct(item["gold"], candidate.text):
-                        any_correct = True
+
+                try:
+                    if output.outputs:
+                        selected_text = output.outputs[0].text
+                        selected_len = len(output.outputs[0].token_ids)
+                    for candidate in output.outputs:
+                        candidate_len = len(candidate.token_ids)
+                        total_len += candidate_len
+                        candidate_correct = self._is_correct(item["gold"], candidate.text)
+                        if candidate_correct:
+                            any_correct = True
+                            selected_text = candidate.text
+                            selected_len = candidate_len
+                            break
+                except Exception:  # noqa: BLE001
+                    any_correct = False
+
                 if any_correct:
                     correct += 1
+
+                details_rows.append(
+                    {
+                        "step": int(state_step),
+                        "dataset_name": name,
+                        "sample_idx": int(sample_idx),
+                        "question": item["question"],
+                        "gold_answer": item["gold"],
+                        "prediction_text": selected_text,
+                        "is_correct": bool(any_correct),
+                        "prediction_token_len": int(selected_len),
+                        "model_path": model_path,
+                    }
+                )
 
             denom = max(len(data) * max(self.eval_args.vllm_eval_n, 1), 1)
             metrics = {
@@ -271,11 +329,34 @@ class SFTVLLMMathEvalCallback(TrainerCallback):
                 f"avg_len={metrics[f'eval/{name}_avg_len']:.1f}, n={len(data)}"
             )
 
+        details_path = self.eval_output_dir / f"eval_step_{int(state_step)}.jsonl"
+        try:
+            with details_path.open("w", encoding="utf-8") as f:
+                for row in details_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            logger.info(f"Saved vLLM eval details to {details_path}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to save vLLM eval details at step={state_step}: {exc}")
+
         del engine
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info(f"Finished vLLM eval at step={state_step} in {time.time() - eval_start:.1f}s")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self.eval_args.vllm_eval_on_train_begin:
+            return control
+        if not self.trainer.accelerator.is_main_process:
+            return control
+        if self._initial_eval_done:
+            return control
+
+        # Prefer latest checkpoint when resuming; otherwise evaluate base model before updates.
+        model_path = self._find_latest_checkpoint() or self.base_model_path
+        self._run_eval_once(state_step=state.global_step, model_path=model_path)
+        self._initial_eval_done = True
+        return control
 
     def on_save(self, args, state, control, **kwargs):
         if not self.trainer.accelerator.is_main_process:
@@ -333,7 +414,13 @@ def main(script_args, training_args, model_args, dataset_args, vllm_eval_args):
     )
 
     if vllm_eval_args.vllm_eval_enabled:
-        trainer.add_callback(SFTVLLMMathEvalCallback(trainer=trainer, eval_args=vllm_eval_args))
+        trainer.add_callback(
+            SFTVLLMMathEvalCallback(
+                trainer=trainer,
+                eval_args=vllm_eval_args,
+                base_model_path=model_args.model_name_or_path,
+            )
+        )
         logger.info("Enabled vLLM eval callback for SFT.")
 
     trainer.train()

@@ -62,6 +62,7 @@ from ...trainer.utils import (
     pad,
 )
 from ..utils import DataCollatorForChatML
+from .eval_callbacks import GOLDVLLMMathEvalCallback
 from .gold_config import GOLDConfig
 
 
@@ -1039,6 +1040,16 @@ class GOLDTrainer(SFTTrainer):
             self._last_vllm_sync_step = -1
 
             self.add_callback(GOLDVLLMSyncCallback(self))
+
+        has_eval_callback_data = bool(getattr(args, "eval_test_names", "") and getattr(args, "eval_test_paths", ""))
+        if has_eval_callback_data:
+            if self.use_vllm:
+                self.add_callback(GOLDVLLMMathEvalCallback(self))
+            else:
+                warnings.warn(
+                    "eval_test_names/eval_test_paths are set but use_vllm=False. GOLD vLLM eval callback is skipped.",
+                    stacklevel=2,
+                )
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()

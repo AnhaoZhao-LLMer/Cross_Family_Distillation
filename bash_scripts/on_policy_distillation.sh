@@ -33,21 +33,10 @@ CUDA_VISIBLE_DEVICES=0 python trl/experimental/gold/gold.py \
   --vllm_mode colocate \
   --vllm_gpu_memory_utilization 0.2 \
   --vllm_tensor_parallel_size 1 \
-  # --vllm_enable_sleep_mode True \
-  # --vllm_server_port 8000
-
-  # --eval_strategy steps \
-  # --eval_steps 20 \
-  # --attn_implementation flash_attention_2 \
-  # --gradient_checkpointing \
-  # --use_uld_loss \
-  # --use_extended_uld \
-  # --uld_use_hybrid_loss \
-  # --uld_crossentropy_weight 0.0 \
-  # --uld_distillation_weight 1.0 \
-  # --uld_student_temperature 1.0 \
-  # --uld_teacher_temperature 1.0 \
-  # --uld_hybrid_unmatched_weight 1.0 \
-  # --uld_hybrid_matched_weight 1.0 \
-  # --push_to_hub \
-  # --hub_model_id <your-username>/Qwen3-4B-GKD-Tulu \
+  --eval_steps 20 \
+  --eval_test_names "gsm8k" \
+  --eval_test_paths "/code/pruning_lrm_pipeline/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl" \
+  --eval_test_samples "200" \
+  --eval_temperature 0.0 \
+  --eval_n 1 \
+  --eval_max_new_tokens 2048

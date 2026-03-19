@@ -345,6 +345,32 @@ class GOLDConfig(SFTConfig):
             "memory usage low, but waking the engine adds host–device transfer latency."
         },
     )
+    # Eval callback parameters
+    eval_test_names: str = field(
+        default="",
+        metadata={"help": "Comma-separated evaluation dataset names used by GOLD vLLM eval callback."},
+    )
+    eval_test_paths: str = field(
+        default="",
+        metadata={"help": "Comma-separated JSON/JSONL paths for evaluation datasets."},
+    )
+    eval_test_samples: str = field(
+        default="all",
+        metadata={"help": "Sample limits per evaluation dataset. Single value or comma-separated list."},
+    )
+    eval_temperature: float = field(
+        default=0.0,
+        metadata={"help": "Sampling temperature for evaluation callback generations."},
+    )
+    eval_n: int = field(
+        default=1,
+        metadata={"help": "Number of generations per prompt for evaluation callback."},
+    )
+    eval_max_new_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Maximum new tokens during callback eval. If None, falls back to max_completion_length."},
+    )
+
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
