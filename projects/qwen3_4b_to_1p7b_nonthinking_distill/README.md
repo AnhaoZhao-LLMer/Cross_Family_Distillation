@@ -48,6 +48,16 @@ This writes:
 
 - `/code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/data/filtered_correct_messages_10k_trunc_c1024.jsonl`
 
+If you want to truncate from `all_generations.jsonl` and convert to `messages` format:
+
+```bash
+bash /code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/scripts/run_truncate_from_all_generations.sh
+```
+
+This writes:
+
+- `/code/on_policy_distillation/trl/projects/qwen3_4b_to_1p7b_nonthinking_distill/data/all_generations_trunc_c1024_messages.jsonl`
+
 ## Notes
 
 - Prompt rendering uses `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` when supported.
